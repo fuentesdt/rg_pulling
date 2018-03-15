@@ -1,0 +1,574 @@
+diff --git a/include/pull.h b/include/pull.h
+index 1dea226..a0527d6 100644
+--- a/include/pull.h
++++ b/include/pull.h
+@@ -112,6 +112,13 @@ void pull_calc_coms(t_commrec *cr,
+                     rvec      *xp    /* updated x, can be NULL */
+                     );
+ 
++/* Get radii of gyration */
++GMX_LIBMD_EXPORT
++void pull_calc_rg(t_commrec *cr,
++                    t_pull *pull, t_mdatoms *md, t_pbc *pbc, double t,
++                  rvec x[], rvec *xp);
++
++    
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/include/types/enums.h b/include/types/enums.h
+index 9bc4436..2af946e 100644
+--- a/include/types/enums.h
++++ b/include/types/enums.h
+@@ -298,7 +298,7 @@ enum {
+ };
+ 
+ enum {
+-    epullgDIST, epullgDIR, epullgCYL, epullgPOS, epullgDIRPBC, epullgNR
++    epullgDIST, epullgDIR, epullgCYL, epullgPOS, epullgDIRPBC, epullgRADIUS_GYR, epullgRADIUS_GYR1, epullgNR
+ };
+ 
+ #define PULL_CYL(pull) ((pull)->eGeom == epullgCYL)
+diff --git a/include/types/inputrec.h b/include/types/inputrec.h
+index d3ab921..2944bd5 100644
+--- a/include/types/inputrec.h
++++ b/include/types/inputrec.h
+@@ -124,6 +124,8 @@ typedef struct {
+     dvec        dr;         /* The distance from the reference group */
+     double      f_scal;     /* Scalar force for directional pulling */
+     dvec        f;          /* force due to the pulling/constraining */
++    double      radius_gyr; /* Radius of gyration */
++    dvec        aver_dr_norm; /* sum_i m_i/M (vec{r}_j - vec{R})/|vec{r}_j - vec{R}|  - needed for linear Rg*/
+ } t_pullgrp;
+ 
+ typedef struct {
+diff --git a/src/gmxlib/names.c b/src/gmxlib/names.c
+index 9ec0850..ac7bc56 100644
+--- a/src/gmxlib/names.c
++++ b/src/gmxlib/names.c
+@@ -216,7 +216,7 @@ const char *epull_names[epullNR+1] = {
+ };
+ 
+ const char *epullg_names[epullgNR+1] = {
+-    "distance", "direction", "cylinder", "position", "direction-periodic", NULL
++    "distance", "direction", "cylinder", "position", "direction-periodic", "radius-of-gyration", "radius-of-gyration1", NULL
+ };
+ 
+ const char *erotg_names[erotgNR+1] = {
+diff --git a/src/mdlib/pull.c b/src/mdlib/pull.c
+index ce5961e..8b06225 100644
+--- a/src/mdlib/pull.c
++++ b/src/mdlib/pull.c
+@@ -78,7 +78,7 @@ static void pull_print_x_grp(FILE *out, gmx_bool bRef, ivec dim, t_pullgrp *pgrp
+ 
+ static void pull_print_x(FILE *out, t_pull *pull, double t)
+ {
+-    int g;
++    int g, m;
+ 
+     fprintf(out, "%.4f", t);
+ 
+@@ -90,6 +90,20 @@ static void pull_print_x(FILE *out, t_pull *pull, double t)
+             pull_print_x_grp(out, FALSE, pull->dim, &pull->grp[g]);
+         }
+     }
++    else if (pull->eGeom == epullgRADIUS_GYR || pull->eGeom == epullgRADIUS_GYR1)
++    {
++        for (g = 1; g < 1+pull->ngrp; g++)
++        {
++            for (m = 0; m < DIM; m++)
++            {
++                if (pull->dim[m])
++                {                    
++                    fprintf(out, "\t%g", pull->grp[g].x[m]);
++                }
++            }
++            fprintf(out, "\t%g", pull->grp[g].radius_gyr);
++        }
++    }
+     else
+     {
+         for (g = 0; g < 1+pull->ngrp; g++)
+@@ -250,9 +264,127 @@ static void apply_forces_grp(t_pullgrp *pgrp, t_mdatoms * md,
+     }
+ }
+ 
++/* Apply forces in a mass weighted fashion for radius of gyration pulling */
++static void apply_forces_grp_rg(t_pullgrp *pgrp, t_mdatoms * md,
++                                gmx_ga2la_t ga2la,
++                                dvec f_pull, rvec *f, rvec *x, t_pbc *pbc, t_pull *pull)
++{
++    int    i, ii, m, start, end;
++    double wmass, inv_wm, inv_Rg;
++    rvec   com_rvec, dx, dx_norm;
++    dvec fsum;
++    real ftmp;
++
++    start = md->start;
++    end   = md->homenr + start;
++
++    inv_wm = pgrp->wscale*pgrp->invtm;
++    inv_Rg = 1/pgrp->radius_gyr;
++
++    /* IMPORTANT: The derivative of Rg wrt. to atom j has in principle two components
++                  1) Due to the movement of atom j
++                  2) Due to the influence of r_j on the center of mass. 
++                  However, the derivative to to (2) is zero. So we have simply:
++
++          square-weighted Rg:
++              grad_j Rg = 1/Rg * m_j/M * (vec{r}_j - vec{R})
++
++          linear-weighted Rg:
++              grad_j Rg =   m_j/M * (vec{r}_j - vec{R})/|vec{r}_j - vec{R}|
++                          - m_j_M * sum_i m_i/M (vec{r}_j - vec{R})/|vec{r}_j - vec{R}|
++    */
++    
++    for (m = 0; m < DIM; m++)
++    {
++        /* Get rvec version of center of mass, to be used in pbc_dx */
++        com_rvec[m] = pgrp->x[m];
++    }
++
++    // printf("Rg = %10g f_scal = %10g com_rvec = %8g %8g %8g\n", pgrp->radius_gyr, pgrp->f_scal, com_rvec[0], com_rvec[1], com_rvec[2]);
++
++    /* rvec test1, test2;
++    clear_rvec(test1);
++    clear_rvec(test2);
++    */
++
++    clear_dvec(fsum);
++    for (i = 0; i < pgrp->nat_loc; i++)
++    {
++        ii    = pgrp->ind_loc[i];
++        wmass = md->massT[ii];
++        if (pgrp->weight_loc)
++        {
++            wmass *= pgrp->weight_loc[i];
++        }
++
++        /* Get (vec{r}_j - vec{R}) */
++        pbc_dx(pbc, x[ii], com_rvec, dx);
++
++        if (pull->eGeom == epullgRADIUS_GYR1)
++        {
++            /* Use only those directions with dim[m] == TRUE, otherwise the norm gets wrong */
++            copy_rvec(dx, dx_norm);
++            for (m = 0; m < DIM; m++)
++            {
++                if (!pull->dim[m])
++                {
++                    dx_norm[m] = 0;
++                }
++            }
++            svmul(1/norm(dx_norm), dx, dx_norm);
++        }
++
++        for (m = 0; m < DIM; m++)
++        {
++            if (pull->dim[m])
++            {
++                if (pull->eGeom == epullgRADIUS_GYR)
++                {
++                    /* For normal distance-square-weighted radius of gyration, do sqrt */
++                    ftmp = pgrp->f_scal * inv_Rg * wmass * inv_wm * dx[m];
++                }
++                else if (pull->eGeom == epullgRADIUS_GYR1)
++                {
++                    /* For distance-linear-weighted radius of gyration */ 
++                    ftmp = pgrp->f_scal * wmass * inv_wm * ( dx_norm[m] - pgrp->aver_dr_norm[m]);
++                    /*test1[m] += wmass*(dx_norm[m] - pgrp->aver_dr_norm[m]);
++                    test2[m] += wmass*(dx_norm[m]);
++                    */
++                }
++                else
++                {
++                    gmx_fatal(FARGS, "Expected pull geometry radius of gyration in pull_calc_rg()\n");
++                }
++                f[ii][m] += ftmp;
++                fsum [m] += ftmp;
++            }
++            // f[ii][m] += sign * wmass * f_pull[m] * inv_wm;
++        }
++        // printf("atom %d) dx_norm = %9g %9g %9g  test2 = %9g %9g %9g \n", i, dx_norm[0], dx_norm[1], dx_norm[2], test2[0], test2[1], test2[2]);
++    }
++
++    /*
++      // This check only works with OpenMP parallelization, and would otherwise need another communication 
++    gmx_bool bNonZeroFsum = FALSE;
++    for (m = 0; m < DIM; m++)
++    {
++        bNonZeroFsum |= (fabs(fsum[m]) > 0.1);
++    }
++    if (bNonZeroFsum)
++    {
++        gmx_fatal(FARGS, "The total force sum from Rg pulling is not zero: %10g %10g %10g\n", fsum[XX], fsum[YY], fsum[ZZ]);
++    }
++    */
++    /* printf("Total f = %8g %8g %8g - test1 = %9g %9g %9g \n", fsum[0], fsum[1], fsum[2], inv_wm*test1[0], inv_wm*test1[1], inv_wm*test1[2]);
++    printf("Total f = %8g %8g %8g - test2 = %9g %9g %9g \n\n", fsum[0], fsum[1], fsum[2], inv_wm*test2[0], inv_wm*test2[1], inv_wm*test2[2]);
++    fflush(stdout);
++    */
++}
++
++
+ /* Apply forces in a mass weighted fashion */
+ static void apply_forces(t_pull * pull, t_mdatoms * md, gmx_ga2la_t ga2la,
+-                         rvec *f)
++                         rvec *f, rvec *x, t_pbc *pbc)
+ {
+     int        i;
+     t_pullgrp *pgrp;
+@@ -260,7 +392,14 @@ static void apply_forces(t_pull * pull, t_mdatoms * md, gmx_ga2la_t ga2la,
+     for (i = 1; i < pull->ngrp+1; i++)
+     {
+         pgrp = &(pull->grp[i]);
+-        apply_forces_grp(pgrp, md, ga2la, pgrp->f, 1, f);
++        if (pull->eGeom == epullgRADIUS_GYR || pull->eGeom == epullgRADIUS_GYR1)
++        {
++            apply_forces_grp_rg(pgrp, md, ga2la, pgrp->f, f, x, pbc, pull);
++        }
++        else
++        {
++            apply_forces_grp(pgrp, md, ga2la, pgrp->f, 1, f);
++        }
+         if (pull->grp[0].nat)
+         {
+             if (PULL_CYL(pull))
+@@ -326,10 +465,13 @@ static void get_pullgrps_dr(const t_pull *pull, const t_pbc *pbc, int g, double
+         dr[m] *= pull->dim[m];
+         dr2   += dr[m]*dr[m];
+     }
+-    if (max_dist2 >= 0 && dr2 > 0.98*0.98*max_dist2)
++    if (pull->eGeom != epullgRADIUS_GYR && pull->eGeom != epullgRADIUS_GYR1)
+     {
+-        gmx_fatal(FARGS, "Distance of pull group %d (%f nm) is larger than 0.49 times the box size (%f).\nYou might want to consider using \"pull-geometry = direction-periodic\" instead.\n", g, sqrt(dr2), sqrt(max_dist2));
++        if (max_dist2 >= 0 && dr2 > 0.98*0.98*max_dist2)
++        {
++            gmx_fatal(FARGS, "Distance of pull group %d (%f nm) is larger than 0.49 times the box size (%f).\nYou might want to consider using \"pull-geometry = direction-periodic\" instead. (eGeom = %d)\n", g, sqrt(dr2), sqrt(max_dist2), pull->eGeom);
+ 
++        }
+     }
+ 
+     if (pull->eGeom == epullgDIRPBC)
+@@ -426,6 +568,10 @@ void get_pullgrp_distance(t_pull *pull, t_pbc *pbc, int g, double t,
+                 dev[m] = (dr[m] - ref[m])*pull->dim[m];
+             }
+             break;
++        case epullgRADIUS_GYR:
++        case epullgRADIUS_GYR1:
++            dev[0] = pgrp->radius_gyr - ref[0];
++            break;
+     }
+ }
+ 
+@@ -992,6 +1138,22 @@ static void do_pull_pot(int ePull,
+                     }
+                 }
+                 break;
++            case epullgRADIUS_GYR:
++            case epullgRADIUS_GYR1:
++                if (ePull == epullUMBRELLA)
++                {
++                    pgrp->f_scal  =       -k*dev[0];
++                    *V           += 0.5*   k*dsqr(dev[0]);
++                    *dVdl        += 0.5*dkdl*dsqr(dev[0]);
++                    /* Do not have a uniform force direction. Need to comupte the force directions 
++                       in apply_forces() */
++                    clear_dvec(pgrp->f);
++                }
++                else
++                {
++                    gmx_fatal(FARGS, "With radius of gyration pulling, can only do pull = umbrella\n");
++                }
++                break;;
+         }
+ 
+         if (vir)
+@@ -1016,11 +1178,21 @@ real pull_potential(int ePull, t_pull *pull, t_mdatoms *md, t_pbc *pbc,
+ 
+     pull_calc_coms(cr, pull, md, pbc, t, x, NULL);
+ 
++    /* Compute radii of gyration */
++    if (pull->eGeom == epullgRADIUS_GYR || pull->eGeom == epullgRADIUS_GYR1)
++    {
++        if (pull->grp[0].nat)
++        {
++            gmx_fatal(FARGS, "With pull geometry = radius of gyration, you should have an empty reference group (pull group 0)\n");
++        }
++        pull_calc_rg(cr, pull, md, pbc, t, x, NULL);
++    }
++    
+     do_pull_pot(ePull, pull, pbc, t, lambda,
+                 &V, pull->bVirial && MASTER(cr) ? vir : NULL, &dVdl);
+ 
+     /* Distribute forces over pulled groups */
+-    apply_forces(pull, md, DOMAINDECOMP(cr) ? cr->dd->ga2la : NULL, f);
++    apply_forces(pull, md, DOMAINDECOMP(cr) ? cr->dd->ga2la : NULL, f, x, pbc);
+ 
+     if (MASTER(cr))
+     {
+diff --git a/src/mdlib/pullutil.c b/src/mdlib/pullutil.c
+index b1da88b..f59f831 100644
+--- a/src/mdlib/pullutil.c
++++ b/src/mdlib/pullutil.c
+@@ -374,6 +374,7 @@ void pull_calc_coms(t_commrec *cr,
+                         }
+                         if (xp)
+                         {
++                            gmx_fatal(FARGS, "For Rg pulling, should have only pull = umbrella\n");
+                             for (m = 0; m < DIM; m++)
+                             {
+                                 comp[m] += wm*xp[ii][m];
+@@ -390,6 +391,7 @@ void pull_calc_coms(t_commrec *cr,
+                         }
+                         if (xp)
+                         {
++                            gmx_fatal(FARGS, "For Rg pulling, should have only pull = umbrella\n");
+                             /* For xp add the difference between xp and x to dx,
+                              * such that we use the same periodic image,
+                              * also when xp has a large displacement.
+@@ -532,3 +534,232 @@ void pull_calc_coms(t_commrec *cr,
+         make_cyl_refgrps(cr, pull, md, pbc, t, x, xp);
+     }
+ }
++
++/* Compute radii of gyration or the linearized radius of gyration
++
++   With epullgRADIUS_GYR:  Rg = [ M^[-1] * sum_i m_i (r_i - Rs)^2 ]^(1/2)
++
++   With epullgRADIUS_GYR1: Rg = M^[-1] * sum_i m_i |r_i - Rs|
++ */
++void pull_calc_rg(t_commrec *cr,
++                    t_pull *pull, t_mdatoms *md, t_pbc *pbc, double t,
++                    rvec x[], rvec *xp)
++{
++    int        g, i, ii, m;
++    real       mass, w, wm, twopi_box = 0;
++    double     wmass, wwmass, invwmass;
++    dvec       com, comp, rg_sum, rg_sum_tmp, dvec_tmp; // Jochen: use dvec for rg_sum, so I can use the same global sum routine as for COM above
++    double     cm, sm, cmp, smp, ccm, csm, ssm, csw, snw, dist2;
++    rvec      *xx[2], x_pbc = {0, 0, 0}, dx, com_rvec;
++    t_pullgrp *pgrp;
++
++    // Jochen: for Rg pulling, xp == NULL since I do not have 
++    
++    if (pull->rbuf == NULL)
++    {
++        snew(pull->rbuf, 1+pull->ngrp);
++    }
++    if (pull->dbuf == NULL)
++    {
++        snew(pull->dbuf, 3*(1+pull->ngrp));
++    }
++
++    if (pull->bRefAt)
++    {
++        pull_set_pbcatoms(cr, pull, md, x, pull->rbuf);
++    }
++
++    if (pull->cosdim >= 0)
++    {
++        for (m = pull->cosdim+1; m < pull->npbcdim; m++)
++        {
++            if (pbc->box[m][pull->cosdim] != 0)
++            {
++                gmx_fatal(FARGS, "Can not do cosine weighting for trilinic dimensions");
++            }
++        }
++        twopi_box = 2.0*M_PI/pbc->box[pull->cosdim][pull->cosdim];
++    }
++
++    for (g = 0; g < 1+pull->ngrp; g++)
++    {
++        pgrp = &pull->grp[g];
++        clear_dvec(com);
++        clear_dvec(comp);
++        wmass  = 0;
++        wwmass = 0;
++        cm     = 0;
++        sm     = 0;
++        cmp    = 0;
++        smp    = 0;
++        ccm    = 0;
++        csm    = 0;
++        ssm    = 0;
++        clear_dvec(rg_sum);
++        clear_dvec(rg_sum_tmp);
++        if (!(g == 0 && PULL_CYL(pull)))
++        {
++            if (pgrp->epgrppbc == epgrppbcREFAT)
++            {
++                /* Set the pbc atom */
++                copy_rvec(pull->rbuf[g], x_pbc);
++            }
++            w = 1;
++            for (i = 0; i < pgrp->nat_loc; i++)
++            {
++                ii   = pgrp->ind_loc[i];
++                mass = md->massT[ii];
++                if (pgrp->epgrppbc != epgrppbcCOS)
++                {
++                    if (pgrp->weight_loc)
++                    {
++                        w = pgrp->weight_loc[i];
++                    }
++                    wm      = w*mass;
++                    wmass  += wm;
++                    wwmass += wm*w;
++                    if (pgrp->epgrppbc == epgrppbcNONE)
++                    {
++                        gmx_fatal(FARGS, "Rg pulling, should not be here (epgrppbcNONE)\n"); 
++                        /* Plain COM: sum the coordinates */
++                    }
++                    else
++                    {
++                        /* JOCHEN: get difference wrt. center of mass of this pull group */
++                        for (m = 0; m < DIM; m++)
++                        {
++                            /* Get rvec version of center of mass, to be used in pbc_dx */
++                            com_rvec[m] = pgrp->x[m];
++                        }
++                        pbc_dx(pbc, x[ii], com_rvec, dx);
++                        dist2 = 0;
++                        clear_dvec(dvec_tmp);
++                        for (m = 0; m < DIM; m++)
++                        {
++                            /* sum up m_i(r_i - Rs)^2 for requested dimensions */
++                            if (pull->dim[m])
++                            {
++                                /* Get square distance of atom to centerf of mass */
++                                dist2 += dsqr(dx[m]);
++
++                                /* Keep vector r_j - R, if dimension m is used */
++                                dvec_tmp[m] = dx[m];
++                            }
++                        }
++
++                        if (pull->eGeom == epullgRADIUS_GYR)
++                        {
++                            /* For normal distance-square-weighted radius of gyration */
++                            rg_sum[0] += wm*dist2;
++                        }
++                        else if (pull->eGeom == epullgRADIUS_GYR1)
++                        {
++                            /* For distance-linear-weighted radius of gyration */ 
++                            rg_sum[0]     += wm*sqrt(dist2);
++
++                            /* Keep m_j * (vec{r}_j - vec{R})/|vec{r}_j - vec{R}| */
++                            dsvmul(wm/dnorm(dvec_tmp), dvec_tmp, dvec_tmp);
++                            dvec_inc(rg_sum_tmp, dvec_tmp);
++                            /*fprintf(stderr,"i = %d, dx       = %8g %8g %8g -- rg_sum_tmp = %8g %8g %8g\n", i, 
++                                    dx[0], dx[1], dx[2], rg_sum_tmp[0], rg_sum_tmp[1], rg_sum_tmp[2]);
++                            fprintf(stderr,"i = %d, dvec_tmp = %8g %8g %8g -- rg_sum_tmp = %8g %8g %8g\n", i,
++                            dvec_tmp[0], dvec_tmp[1], dvec_tmp[2], rg_sum_tmp[0], rg_sum_tmp[1], rg_sum_tmp[2]); */
++
++                        }
++                        else
++                        {
++                            gmx_fatal(FARGS, "Expected pull geometry radius of gyration in pull_calc_rg()\n");
++                        }
++                    }
++                }
++                else
++                {
++                    gmx_fatal(FARGS, "Rg pulling, should not be here\n");
++                }
++            }
++        }
++
++        /* Copy local sums to a buffer for global summing */
++        switch (pgrp->epgrppbc)
++        {
++            case epgrppbcNONE:
++            case epgrppbcREFAT:
++                copy_dvec(rg_sum,     pull->dbuf[g*3]);   // Changed by Jochen
++                copy_dvec(rg_sum_tmp, pull->dbuf[g*3+1]); // Changed by Jochen
++                pull->dbuf[g*3+2][0] = wmass;
++                pull->dbuf[g*3+2][1] = wwmass;
++                pull->dbuf[g*3+2][2] = 0;
++                break;
++            case epgrppbcCOS:
++                pull->dbuf[g*3  ][0] = cm;
++                pull->dbuf[g*3  ][1] = sm;
++                pull->dbuf[g*3  ][2] = 0;
++                pull->dbuf[g*3+1][0] = ccm;
++                pull->dbuf[g*3+1][1] = csm;
++                pull->dbuf[g*3+1][2] = ssm;
++                pull->dbuf[g*3+2][0] = cmp;
++                pull->dbuf[g*3+2][1] = smp;
++                pull->dbuf[g*3+2][2] = 0;
++                break;
++        }
++    }
++
++    if (cr && PAR(cr))
++    {
++        /* Sum the contributions over the nodes */
++        gmx_sumd((1+pull->ngrp)*3*DIM, pull->dbuf[0], cr);
++    }
++
++    for (g = 0; g < 1+pull->ngrp; g++)
++    {
++        pgrp = &pull->grp[g];
++        if (pgrp->nat > 0 && !(g == 0 && PULL_CYL(pull)))
++        {
++            if (pgrp->epgrppbc != epgrppbcCOS)
++            {
++                /* Determine the inverse mass */
++                wmass    = pull->dbuf[g*3+2][0];
++                wwmass   = pull->dbuf[g*3+2][1];
++                invwmass = 1/wmass;
++                /* invtm==0 signals a frozen group, so then we should keep it zero */
++                if (pgrp->invtm > 0)
++                {
++                    pgrp->wscale = wmass/wwmass;
++                    pgrp->invtm  = 1.0/(pgrp->wscale*wmass);
++                }
++
++                // Added by Jochen
++                /* Divide com_rvec by the total mass */
++                if (pull->eGeom == epullgRADIUS_GYR)
++                {
++                    /* For normal distance-square-weighted radius of gyration, do sqrt */
++                    pgrp->radius_gyr = sqrt(pull->dbuf[g*3  ][0]*invwmass);
++                }
++                else if (pull->eGeom == epullgRADIUS_GYR1)
++                {
++                    /* For distance-linear-weighted radius of gyration */ 
++                    pgrp->radius_gyr = pull->dbuf[g*3  ][0]*invwmass;
++
++                    /* Keep: sum_i m_i/M (vec{r}_j - vec{R})/|vec{r}_j - vec{R}| */
++                    dsvmul(invwmass, pull->dbuf[g*3+1], pgrp->aver_dr_norm);
++                }
++                // printf("Rg: %8g %8g aver_dr_norm = %8g %8g %8g - invwmass = %g\n", t, pgrp->radius_gyr, pgrp->aver_dr_norm[XX], pgrp->aver_dr_norm[YY], pgrp->aver_dr_norm[ZZ], invwmass); fflush(stdout);
++            }
++            else
++            {
++                gmx_fatal(FARGS, "Radii of gyration pulling, found strange pgrp->epgrppbc\n");
++            }
++            if (debug)
++            {
++                fprintf(debug, "Pull group %d wmass %f wwmass %f invtm %f\n",
++                        g, wmass, wwmass, pgrp->invtm);
++            }
++        }
++    }
++
++    if (PULL_CYL(pull))
++    {
++        /* Calculate the COMs for the cyclinder reference groups */
++        make_cyl_refgrps(cr, pull, md, pbc, t, x, xp);
++    }
++}
+diff --git a/src/tools/gmx_wham.c b/src/tools/gmx_wham.c
+index 38fd567..7c56f5b 100644
+--- a/src/tools/gmx_wham.c
++++ b/src/tools/gmx_wham.c
+@@ -1934,6 +1934,7 @@ void read_tpr_header(const char *fn, t_UmbrellaHeader* header, t_UmbrellaOptions
+             case epullgDIST:
+             case epullgDIR:
+             case epullgDIRPBC:
++            case epullgRADIUS_GYR:
+                 header->umbInitDist[i] = header->init_dist[i][0];
+                 break;
+             default:
